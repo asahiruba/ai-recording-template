@@ -1,0 +1,69 @@
+name: 初期設定
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: プロジェクトの題名（日本語でよい）
+        required: true
+        type: string
+      drive_folder:
+        description: Google Drive のフォルダ（空欄なら AI-Projects/リポジトリ名）
+        required: false
+        type: string
+      force:
+        description: 初期設定済みでもやり直す
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  init:
+    if: ${{ !github.event.repository.is_template }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: 必要なライブラリを入れる
+        run: pip install pyyaml==6.0.2
+
+      - name: テンプレート元を調べる
+        id: tpl
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TEMPLATE=$(gh api "repos/${{ github.repository }}" --jq '.template_repository.full_name // empty' || true)
+          echo "repo=$TEMPLATE" >> "$GITHUB_OUTPUT"
+
+      - name: 初期設定
+        env:
+          TITLE: ${{ inputs.title }}
+          DRIVE: ${{ inputs.drive_folder }}
+          TEMPLATE: ${{ steps.tpl.outputs.repo }}
+          FORCE: ${{ inputs.force }}
+          TZ: Asia/Tokyo
+        run: |
+          EXTRA=""
+          if [ "$FORCE" = "true" ]; then EXTRA="--force"; fi
+          python scripts/init_project.py --repo "${{ github.repository }}" --title "$TITLE" --drive "$DRIVE" --template "$TEMPLATE" $EXTRA
+          python scripts/build_index.py
+
+      - name: 結果をコミットする
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "変更はありません"
+            exit 0
+          fi
+          git commit -m "プロジェクトの初期設定"
+          git push

@@ -1,0 +1,61 @@
+name: ルールの同期
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: ${{ !github.event.repository.is_template }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: テンプレートを取得する
+        env:
+          # テンプレートが Private の場合だけ、読み取り用のトークンを RULES_TOKEN として登録する
+          RULES_TOKEN: ${{ secrets.RULES_TOKEN }}
+        run: |
+          TEMPLATE=$(python -c "import json; print(json.load(open('recording.json')).get('template_repo', ''))" 2>/dev/null || true)
+          if [ -z "$TEMPLATE" ]; then
+            echo "::error::recording.json に template_repo がありません。先に「初期設定」を実行してください。"
+            exit 1
+          fi
+          if ! printf '%s' "$TEMPLATE" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::recording.json の template_repo（${TEMPLATE}）は OWNER/NAME の形で書きます。"
+            exit 1
+          fi
+          # トークンは URL に入れず、この clone の間だけヘッダーとして渡す（ディスクに残さない）
+          AUTH=()
+          if [ -n "$RULES_TOKEN" ]; then
+            BASIC=$(printf 'x-access-token:%s' "$RULES_TOKEN" | base64 -w0)
+            echo "::add-mask::$BASIC"
+            AUTH=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $BASIC")
+          fi
+          if ! git "${AUTH[@]}" clone --depth 1 "https://github.com/${TEMPLATE}.git" "$RUNNER_TEMP/template"; then
+            echo "::error::テンプレート（${TEMPLATE}）を取得できませんでした。Private の場合は RULES_TOKEN を登録してください。"
+            exit 1
+          fi
+          echo "TEMPLATE_SHA=$(git -C "$RUNNER_TEMP/template" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: ルールを写す
+        run: python scripts/sync_rules.py "$RUNNER_TEMP/template"
+
+      - name: 結果をコミットする
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "ルールは最新です"
+            exit 0
+          fi
+          git commit -m "ルールを同期（テンプレート ${TEMPLATE_SHA}）"
+          git push
