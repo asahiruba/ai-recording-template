@@ -1,10 +1,17 @@
 name: ルールの同期
 
+# テンプレートのルールを写し、プルリクエストにする。内容を確認してから取り込む（Merge）。
 on:
   workflow_dispatch:
+    inputs:
+      template_ref:
+        description: 取り込むテンプレートのコミットID（空欄ならテンプレートの最新）
+        required: false
+        type: string
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync:
@@ -22,6 +29,7 @@ jobs:
         env:
           # テンプレートが Private の場合だけ、読み取り用のトークンを RULES_TOKEN として登録する
           RULES_TOKEN: ${{ secrets.RULES_TOKEN }}
+          TEMPLATE_REF: ${{ inputs.template_ref }}
         run: |
           TEMPLATE=$(python -c "import json; print(json.load(open('recording.json')).get('template_repo', ''))" 2>/dev/null || true)
           if [ -z "$TEMPLATE" ]; then
@@ -32,6 +40,10 @@ jobs:
             echo "::error::recording.json の template_repo（${TEMPLATE}）は OWNER/NAME の形で書きます。"
             exit 1
           fi
+          if [ -n "$TEMPLATE_REF" ] && ! printf '%s' "$TEMPLATE_REF" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "::error::コミットID（${TEMPLATE_REF}）は、7〜40文字の英小文字と数字で入れます。"
+            exit 1
+          fi
           # トークンは URL に入れず、この clone の間だけヘッダーとして渡す（ディスクに残さない）
           AUTH=()
           if [ -n "$RULES_TOKEN" ]; then
@@ -39,23 +51,71 @@ jobs:
             echo "::add-mask::$BASIC"
             AUTH=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $BASIC")
           fi
-          if ! git "${AUTH[@]}" clone --depth 1 "https://github.com/${TEMPLATE}.git" "$RUNNER_TEMP/template"; then
+          DIR="$RUNNER_TEMP/template"
+          if ! git "${AUTH[@]}" clone -q "https://github.com/${TEMPLATE}.git" "$DIR"; then
             echo "::error::テンプレート（${TEMPLATE}）を取得できませんでした。Private の場合は RULES_TOKEN を登録してください。"
             exit 1
           fi
-          echo "TEMPLATE_SHA=$(git -C "$RUNNER_TEMP/template" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          if [ -n "$TEMPLATE_REF" ]; then
+            # テンプレートの既定のブランチに含まれるコミットだけを受け付ける
+            if ! SHA=$(git -C "$DIR" rev-parse --verify -q "${TEMPLATE_REF}^{commit}") \
+               || ! git -C "$DIR" merge-base --is-ancestor "$SHA" HEAD; then
+              echo "::error::コミット ${TEMPLATE_REF} がテンプレートの既定のブランチに見つかりません。"
+              exit 1
+            fi
+            git -C "$DIR" checkout -q --detach "$SHA"
+          fi
+          {
+            echo "TEMPLATE=$TEMPLATE"
+            echo "TEMPLATE_SHA=$(git -C "$DIR" rev-parse HEAD)"
+            echo "TEMPLATE_SHORT=$(git -C "$DIR" rev-parse --short=7 HEAD)"
+          } >> "$GITHUB_ENV"
 
       - name: ルールを写す
-        run: python scripts/sync_rules.py "$RUNNER_TEMP/template"
+        run: python scripts/sync_rules.py "$RUNNER_TEMP/template" | tee "$RUNNER_TEMP/sync.log"
 
-      - name: 結果をコミットする
+      - name: 確認用のプルリクエストを作る
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.repository.default_branch }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "ルールは最新です"
+            echo "ルールは最新です（テンプレート ${TEMPLATE_SHORT}）" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          git commit -m "ルールを同期（テンプレート ${TEMPLATE_SHA}）"
-          git push
+          BRANCH="rules-sync/${TEMPLATE_SHORT}"
+          git switch -q -c "$BRANCH"
+          git commit -q -m "ルールを同期（テンプレート ${TEMPLATE_SHORT}）"
+          # 同期用のブランチだけを書き換える（main には直接書き込まない）
+          git push -q --force origin "HEAD:refs/heads/${BRANCH}"
+
+          BODY="$RUNNER_TEMP/body.md"
+          {
+            echo "テンプレート [${TEMPLATE}@${TEMPLATE_SHORT}](https://github.com/${TEMPLATE}/commit/${TEMPLATE_SHA}) のルールを写しました。"
+            echo
+            echo "「Files changed」で内容を確認し、問題がなければ「Merge pull request」を押します。取り込まない場合は「Close pull request」を押します。"
+            echo
+            echo "## 変わるファイル"
+            echo
+            git diff --name-only HEAD~1 HEAD | sed 's/^/- `/; s/$/`/'
+            if grep -q '^::notice::' "$RUNNER_TEMP/sync.log"; then
+              echo
+              echo "## 手で置き換えるファイル"
+              echo
+              grep '^::notice::' "$RUNNER_TEMP/sync.log" | sed 's/^::notice::/- /'
+            fi
+          } > "$BODY"
+          cat "$BODY" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "同じ版のプルリクエストがすでにあるため、その内容を更新しました。"
+            exit 0
+          fi
+          if ! gh pr create --base "$BASE" --head "$BRANCH" \
+               --title "ルールの同期（テンプレート ${TEMPLATE_SHORT}）" --body-file "$BODY"; then
+            echo "::error::プルリクエストを作れませんでした。Settings → Actions → General の「Allow GitHub Actions to create and approve pull requests」をオンにして、もう一度実行してください（写した内容はブランチ ${BRANCH} にあります）。"
+            exit 1
+          fi

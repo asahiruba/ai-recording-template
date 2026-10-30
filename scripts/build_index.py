@@ -63,6 +63,32 @@ TIMELINE_RECENT = 100
 CHANGE_LOG_KEEP = 200
 HEADER = "<!-- 自動生成：scripts/build_index.py。このファイルは編集しないでください。 -->\n"
 
+# 秘密情報らしい文字列。生成するファイルには写さず、［伏せ字：種類］に置き換えて checks.md で知らせる。
+# 形の決まったものしか見つけられないため、個人情報などは AGENTS.md のとおり書く側が伏せる。
+SECRET_PATTERNS = [
+    ("秘密鍵", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)")),
+    ("AWSのアクセスキー", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("GitHubのトークン", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})")),
+    ("APIキー", re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}")),
+    ("GoogleのAPIキー", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+    ("Slackのトークン", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("パスワード", re.compile(r"(?i)((?:password|passwd|pwd|パスワード)\s*[:：=]\s*)([^\s［*＊]{4,})")),
+]
+
+
+def find_secrets(text: str) -> list:
+    """見つかった秘密情報の種類（値は返さない）"""
+    return [kind for kind, rx in SECRET_PATTERNS if rx.search(text)]
+
+
+def redact(text: str) -> str:
+    for kind, rx in SECRET_PATTERNS:
+        if kind == "パスワード":
+            text = rx.sub(lambda m: m.group(1) + f"［伏せ字：{kind}］", text)
+        else:
+            text = rx.sub(f"［伏せ字：{kind}］", text)
+    return text
+
 
 # ---------------------------------------------------------------- 読み込み
 
@@ -73,6 +99,7 @@ class Entry:
     sections: dict
     order: list
     added: str | None = None
+    secrets: tuple = ()
 
     def get(self, key, default=None):
         return self.meta.get(key, default)
@@ -123,6 +150,8 @@ def norm_id(value) -> str | None:
 def parse_entry(path: Path, problems: list) -> Entry | None:
     rel = path.relative_to(ROOT).as_posix()
     text = path.read_text(encoding="utf-8")
+    secrets = tuple(find_secrets(text))
+    text = redact(text)  # 生成するファイルに秘密情報を写さない
     m = FRONT_RE.match(text)
     if not m:
         problems.append((rel, "冒頭の項目（--- で囲んだYAML）が見つかりません"))
@@ -147,7 +176,7 @@ def parse_entry(path: Path, problems: list) -> Entry | None:
             sections.setdefault(current, "")
         elif current is not None:
             sections[current] += line + "\n"
-    return Entry(path=path, meta=meta, sections=sections, order=order)
+    return Entry(path=path, meta=meta, sections=sections, order=order, secrets=secrets)
 
 
 def git_added_times() -> dict:
@@ -312,6 +341,35 @@ class Model:
 
 # ---------------------------------------------------------------- 検査
 
+ID_IN_TEXT_RE = re.compile(r"\d{8}T\d{4}-[a-z0-9]{4}")
+NONE_RE = re.compile(r"^[-*・\s]*なし(?:[。.（(].*)?\s*$")
+BULLET_RE = re.compile(r"^(?:[-*・]|\d+[.)．])\s*")
+
+
+def plan_items(model: Model, summary: Entry) -> list:
+    """「決定済みの予定」を項目ごとに分け、根拠の decision を調べる。[(行のリスト, 問題 or None)]"""
+    items = []
+    for line in summary.section("決定済みの予定").splitlines():
+        if not line.strip() or NONE_RE.match(line):
+            continue
+        if items and line[:1].isspace() and not BULLET_RE.match(line.strip()):
+            items[-1].append(line)  # 字下げした続きの行
+        else:
+            items.append([line])
+    out = []
+    for lines in items:
+        ids = ID_IN_TEXT_RE.findall(" ".join(lines))
+        decisions = [model.by_id[i] for i in ids if i in model.by_id and model.by_id[i].type == "decision"]
+        if not decisions:
+            problem = "根拠の decision のIDがありません"
+        elif not any(model.active(d) for d in decisions):
+            problem = "根拠の decision は置き換え済みです"
+        else:
+            problem = None
+        out.append((lines, problem))
+    return out
+
+
 def check(model: Model, problems: list) -> list:
     out = list(problems)
     seen = {}
@@ -368,6 +426,13 @@ def check(model: Model, problems: list) -> list:
                 out.append((rel, "artifacts の各項目には name・path・url を書きます"))
             elif not safe_url(art.get("url")):
                 out.append((rel, f"artifacts の url（{art.get('url')}）が https のURLではありません"))
+        if e.secrets:
+            out.append((rel, "秘密情報らしい文字列（" + "、".join(e.secrets) + "）があります。STATUS.md などには伏せ字で写しました。"
+                        "本物のキーやパスワードなら、すぐに無効にしてください"))
+        if e.type == "summary" and model.active(e):  # 置き換え済みのまとめは表示されないため調べない
+            for lines, problem in plan_items(model, e):
+                if problem:
+                    out.append((rel, f"決定済みの予定「{lines[0].strip()[:40]}」：{problem}"))
         if e.theme_dir == "_unsorted":
             out.append((rel, "記録先が不明な記録です。正しいテーマに移す（新しいエントリで記録し直す）必要があります"))
     for theme, items in model.themes().items():
@@ -375,6 +440,12 @@ def check(model: Model, problems: list) -> list:
             continue
         if not any(i.get("theme_title") for i in items):
             out.append((f"themes/{theme}/", "theme_title が書かれたエントリがありません（テーマの最初のエントリに書きます）"))
+    # 原文は生成するファイルに写さないが、秘密情報があれば知らせる
+    for path in sorted(THEMES_DIR.glob("*/verbatim/*.md")) if THEMES_DIR.exists() else []:
+        kinds = find_secrets(path.read_text(encoding="utf-8", errors="replace"))
+        if kinds:
+            out.append((path.relative_to(ROOT).as_posix(), "秘密情報らしい文字列（" + "、".join(kinds) + "）があります。"
+                        "本物のキーやパスワードなら、すぐに無効にしてください"))
     for entry_id, paths in seen.items():
         if len(paths) > 1:
             out.append((paths[0], f"id（{entry_id}）が重複しています：" + "、".join(paths)))
@@ -412,6 +483,16 @@ def change_warnings(changes_file: str | None) -> list:
 
 
 # ---------------------------------------------------------------- 生成
+
+def render_plans(model: Model, summary: Entry) -> str:
+    """根拠の decision がない予定には、ユーザーの承認ではないことを書き添える"""
+    out = []
+    for lines, problem in plan_items(model, summary):
+        out += lines
+        if problem:
+            out[-1] += f"　⚠ {problem}。ユーザーの承認として扱わない"
+    return "\n".join(out)
+
 
 def render_status(model: Model, n_problems: int) -> str:
     themes = model.themes()
@@ -452,6 +533,8 @@ def render_status(model: Model, n_problems: int) -> str:
                 lines.append(f"\n※ このまとめの後に記録が {len(after)} 件あります（{names}）。最新の状況は時系列で確認してください。\n")
             for name in HEADINGS["summary"]:
                 body = summary.section(name) or "なし"
+                if name == "決定済みの予定":
+                    body = render_plans(model, summary) or "なし"
                 lines.append(f"\n### {name}\n\n{body}\n")
                 if name == "未解決・残作業":
                     lines.append("\n### 判断待ち\n\n")

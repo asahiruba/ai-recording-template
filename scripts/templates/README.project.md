@@ -41,4 +41,4 @@ scripts/  .github/workflows/      自動生成と初期設定の仕組み
 
 ## ルールの更新
 
-テンプレート（{{TEMPLATE}}）のルールが更新されたら、Actions の「ルールの同期」を実行します。
+テンプレート（{{TEMPLATE}}）のルールが更新されたら、Actions の「ルールの同期」を実行します。プルリクエストが作られるので、「Files changed」で内容を確認し、問題がなければ Merge します。
