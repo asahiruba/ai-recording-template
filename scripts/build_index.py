@@ -426,6 +426,12 @@ def check(model: Model, problems: list) -> list:
                 out.append((rel, "artifacts の各項目には name・path・url を書きます"))
             elif not safe_url(art.get("url")):
                 out.append((rel, f"artifacts の url（{art.get('url')}）が https のURLではありません"))
+            else:
+                # path は <種類のフォルダ>/<テーマID>/… （05_data は 05_data/raw/<テーマID>/… のように2段）
+                parts = [p for p in str(art.get("path")).split("/") if p]
+                folder = next((p for p in parts[1:3] if THEME_RE.match(p) or p in SPECIAL_THEMES), None)
+                if folder and folder != e.theme_dir:
+                    out.append((rel, f"artifacts の path のテーマのフォルダ（{folder}）が、エントリのテーマ（{e.theme_dir}）と違います"))
         if e.secrets:
             out.append((rel, "秘密情報らしい文字列（" + "、".join(e.secrets) + "）があります。STATUS.md などには伏せ字で写しました。"
                         "本物のキーやパスワードなら、すぐに無効にしてください"))
